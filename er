@@ -1,0 +1,67 @@
+import socket
+import struct
+import binascii
+
+def probe_giop(target_ip, target_port=2809, timeout=5):
+    """
+    Sends a GIOP LocateRequest to detect WebSphere and extract its IOR/Version info.
+    """
+    # GIOP Header for a LocateRequest
+    # "GIOP" (4 bytes) + Version 1.0 (2 bytes) + Order (1 byte, 1=little) + MsgType (1 byte, 3=LocateRequest)
+    # + MsgSize (4 bytes) + RequestID (4 bytes)
+    header = b"GIOP\x01\x00\x01\x03" 
+    
+    # LocateRequest body: a request for the "NameService" object
+    # This is a common object to probe for in WebSphere environments
+    object_key = b"NameService"
+    key_len = struct.pack(">I", len(object_key)) # Big-endian 4-byte length
+    
+    # Constructing the message body
+    # RequestID (4 bytes) + ObjectKey length + ObjectKey
+    request_id = b"\x00\x00\x00\x01"
+    body = request_id + key_len + object_key
+    
+    # Finalize size in header (Big-endian)
+    msg_size = struct.pack(">I", len(body))
+    packet = header + msg_size + body
+
+    print(f"[*] Sending GIOP LocateRequest to {target_ip}:{target_port}...")
+    
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            s.settimeout(timeout)
+            s.connect((target_ip, target_port))
+            s.sendall(packet)
+            
+            # Receive response
+            response = s.recv(1024)
+            
+            if response.startswith(b"GIOP"):
+                print("[+] Valid GIOP response received!")
+                
+                # Check for WebSphere specific markers in the returned IOR or strings
+                if b"WebSphere" in response or b"com.ibm" in response:
+                    print("[!] Success: IBM WebSphere detected on GIOP port.")
+                    
+                    # Heuristic to find the version/cell name if leaked in the binary blob
+                    # We look for printable strings in the response
+                    printable = "".join([chr(b) if 32 <= b < 127 else "." for b in response])
+                    print(f"[*] Raw Data Preview: {printable}")
+                else:
+                    print("[-] GIOP service found, but no WebSphere signatures identified.")
+            else:
+                print("[-] Not a GIOP service or received malformed response.")
+                
+    except socket.timeout:
+        print("[-] Connection timed out.")
+    except Exception as e:
+        print(f"[-] Error: {e}")
+
+if __name__ == "__main__":
+    import sys
+    if len(sys.argv) < 2:
+        print("Usage: python3 giop_detect.py <target_ip> [port]")
+    else:
+        ip = sys.argv[1]
+        port = int(sys.argv[2]) if len(sys.argv) > 2 else 2809
+        probe_giop(ip, port)
