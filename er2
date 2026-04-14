@@ -1,0 +1,79 @@
+import socket
+import struct
+import binascii
+
+def get_ior(target_ip, target_port):
+    # GIOP 1.0 Header: "GIOP", Version 1.0, Little Endian (0x01), MsgType 0x00 (Request)
+    # Total Message Size will be calculated after the body
+    header_base = b"GIOP\x01\x00\x01\x00"
+    
+    # Request Body:
+    # ServiceContextList (empty) + RequestID (1) + ResponseExpected (1) + ObjectKey
+    service_context = b"\x00\x00\x00\x00"
+    request_id = b"\x00\x00\x00\x01"
+    response_expected = b"\x01"
+    
+    # We request "NameService" to force the server to send an IOR reference back
+    object_key = b"NameService"
+    key_len = struct.pack("<I", len(object_key)) # Little-endian for GIOP 1.0/1.1
+    
+    operation = b"get\x00" # Common bootstrap operation
+    op_len = struct.pack("<I", len(operation))
+    
+    body = service_context + request_id + response_expected + op_len + operation + key_len + object_key
+    
+    # Finalize Message Size (Header is 12 bytes total, size is at offset 8)
+    msg_size = struct.pack("<I", len(body))
+    packet = header_base + msg_size + body
+
+    print(f"[*] Attempting to fetch IOR from {target_ip}:{target_port}...")
+
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            s.settimeout(5)
+            s.connect((target_ip, target_port))
+            s.sendall(packet)
+            
+            data = s.recv(4096)
+            
+            # The IOR is usually embedded in the LocateReply or Request response.
+            # We look for the "IOR:" marker or the hex pattern 494f523a
+            if b"IOR:" in data:
+                # If it's already stringified in the response
+                start = data.find(b"IOR:")
+                ior = data[start:].split(b"\x00")[0]
+                return ior.decode('utf-8')
+            
+            elif len(data) > 12:
+                # If it's raw binary, we need to convert the relevant part to Hex
+                # A raw IOR starts with the bytes indicating the type ID length
+                # We'll take the response data after the GIOP header and hexlify it
+                raw_payload = data[12:] 
+                hex_ior = binascii.hexlify(data).decode('utf-8')
+                
+                # Note: GIOP responses can be complex. This finds the hex start of an IOR
+                # (Standard prefix for IOR is '494f52' in hex)
+                index = hex_ior.find("494f52") 
+                if index != -1:
+                    return "IOR:" + hex_ior[index:]
+                
+            return None
+
+    except Exception as e:
+        return f"Error: {e}"
+
+if __name__ == "__main__":
+    import sys
+    if len(sys.argv) < 2:
+        print("Usage: python3 get_ior.py <ip> [port]")
+    else:
+        target = sys.argv[1]
+        port = int(sys.argv[2]) if len(sys.argv) > 2 else 2809
+        result = get_ior(target, port)
+        
+        if result and result.startswith("IOR:"):
+            print("\n[+] Found IOR:")
+            print(f"{result}\n")
+            print("[*] You can decode this at: https://www.catior.org/ or using 'catior' tools.")
+        else:
+            print("[-] Could not retrieve IOR. Service might require a different ObjectKey or GIOP version.")
