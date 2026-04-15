@@ -1,0 +1,296 @@
+#!/usr/bin/env python3
+"""
+GIOP enumerator for IBM WebSphere IIOP ports.
+  1. LocateRequest -- probe whether an object key exists (no auth needed)
+  2. Naming service bootstrap -- get NameService IOR from port 2809/9900,
+     then list() the root context to see every registered CORBA object.
+
+Usage:
+  python3 giop_enum.py <host> <port> locate  <key1> [key2 ...]
+  python3 giop_enum.py <host> <port> naming
+"""
+
+import socket
+import sys
+import struct
+
+
+# ── low-level helpers ────────────────────────────────────────────────────────
+
+def recv_giop(sock):
+    header = b''
+    while len(header) < 12:
+        chunk = sock.recv(12 - len(header))
+        if not chunk:
+            break
+        header += chunk
+    if len(header) < 12 or header[:4] != b'GIOP':
+        sock.settimeout(1.0)
+        try:
+            while True:
+                chunk = sock.recv(4096)
+                if not chunk:
+                    break
+                header += chunk
+        except Exception:
+            pass
+        finally:
+            sock.settimeout(None)
+        return header
+    big_endian = (header[6] == 0)
+    msg_size = int.from_bytes(header[8:12], 'big' if big_endian else 'little')
+    body = b''
+    while len(body) < msg_size:
+        chunk = sock.recv(msg_size - len(body))
+        if not chunk:
+            break
+        body += chunk
+    return header + body
+
+
+def connect(host, port):
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    s.settimeout(10)
+    s.connect((host, port))
+    return s
+
+
+def giop_header(msg_type, body_len):
+    # GIOP 1.0, big-endian, given message type
+    return b'GIOP' + bytes([1, 0, 0, msg_type]) + struct.pack('>I', body_len)
+
+
+def cdr_string(s):
+    """CDR-encode a string: 4-byte length (incl null) + chars + null."""
+    encoded = s.encode('ascii') + b'\x00'
+    return struct.pack('>I', len(encoded)) + encoded
+
+
+def cdr_pad4(data):
+    """Pad data to a 4-byte boundary."""
+    rem = len(data) % 4
+    if rem:
+        data += b'\x00' * (4 - rem)
+    return data
+
+
+# ── GIOP LocateRequest (message type 3) ─────────────────────────────────────
+
+LOCATE_STATUS = {0: 'UNKNOWN_OBJECT', 1: 'OBJECT_HERE', 2: 'OBJECT_FORWARD'}
+
+def locate_request(host, port, object_key, req_id=1):
+    """
+    Send a GIOP 1.0 LocateRequest for `object_key` (bytes or str).
+    Returns (status_name, raw_response).
+    """
+    if isinstance(object_key, str):
+        object_key = object_key.encode('ascii')
+
+    key_field = struct.pack('>I', len(object_key)) + object_key
+    # pad to 4
+    key_field = cdr_pad4(key_field)
+
+    body = struct.pack('>I', req_id) + key_field
+    msg  = giop_header(3, len(body)) + body
+
+    s = connect(host, port)
+    s.send(msg)
+    data = recv_giop(s)
+    s.close()
+
+    if len(data) < 16 or data[:4] != b'GIOP' or data[7] != 4:  # type 4 = LocateReply
+        return ('NO_REPLY', data)
+
+    big_endian = (data[6] == 0)
+    order = 'big' if big_endian else 'little'
+    status = int.from_bytes(data[12:16], order)
+    return (LOCATE_STATUS.get(status, 'STATUS_%d' % status), data)
+
+
+# ── CORBA naming service bootstrap ──────────────────────────────────────────
+#
+# WebSphere IIOP bootstrap: send a Request to the IBM bootstrap object.
+# The bootstrap object key is the JMBI marker embedded in the CodeBase IOR.
+# Operation: "getInitialReferences", arg: service name string.
+# Alternatively use the standard OMG bootstrap object key (zero-length = root).
+#
+# We try two approaches:
+#  A) Standard OMG bootstrap: object key = b'\x00' * 4 (or empty), op = "resolve_initial_references"
+#  B) IBM WAS bootstrap: use the JMBI key captured from a previous response
+
+def giop_request(object_key, operation, body_bytes=b'', req_id=1):
+    """Build a GIOP 1.0 Request message."""
+    if isinstance(object_key, str):
+        object_key = object_key.encode('ascii')
+    if isinstance(operation, str):
+        operation = operation.encode('ascii')
+
+    # RequestHeader (GIOP 1.0, big-endian):
+    # service_context_count (4) + request_id (4) + response_expected (1) +
+    # padding (3) + object_key length (4) + object_key + operation string + principal
+    hdr = struct.pack('>I', 0)          # service_context_count = 0
+    hdr += struct.pack('>I', req_id)    # request_id
+    hdr += b'\x01'                      # response_expected = true
+    hdr += b'\x00\x00\x00'             # padding
+
+    key_enc = struct.pack('>I', len(object_key)) + object_key
+    key_enc = cdr_pad4(key_enc)
+    hdr += key_enc
+
+    op_enc = cdr_string(operation.decode() if isinstance(operation, bytes) else operation)
+    # pad operation to 4
+    hdr += cdr_pad4(op_enc)
+
+    hdr += struct.pack('>I', 0)        # requesting_principal length = 0
+
+    full_body = hdr + body_bytes
+    return giop_header(0, len(full_body)) + full_body
+
+
+def try_bootstrap_naming(host, port):
+    """
+    Try to get the NameService IOR from the WebSphere bootstrap port.
+    Attempts several known object keys and operations.
+    """
+    attempts = [
+        # (object_key, operation, arg_string_or_None)
+        # Standard CORBA bootstrap - empty key, resolve_initial_references
+        (b'', 'resolve_initial_references', 'NameService'),
+        # IBM WAS uses "BootstrapServer" object key
+        (b'BootstrapServer', 'getInitialReferences', 'NameService'),
+        # Some versions use "NamingService" directly
+        (b'NameService', 'resolve', None),
+        # Standard CORBA transient naming context
+        (b'TransientNameService', 'list', None),
+    ]
+
+    for (key, op, arg) in attempts:
+        try:
+            body = b''
+            if arg is not None:
+                body = cdr_string(arg)
+
+            msg = giop_request(key, op, body)
+            s = connect(host, port)
+            s.send(msg)
+            data = recv_giop(s)
+            s.close()
+
+            if len(data) < 12 or data[:4] != b'GIOP':
+                print("  [%s / %s] non-GIOP response (%d bytes)" % (
+                    key or b'<empty>', op, len(data)))
+                continue
+
+            big_endian = (data[6] == 0)
+            order = 'big' if big_endian else 'little'
+
+            # parse past service contexts to reply status
+            offset = 12
+            ctx_count = int.from_bytes(data[offset:offset+4], order)
+            offset += 4
+            for _ in range(ctx_count):
+                if offset + 8 > len(data):
+                    break
+                ctx_data_len = int.from_bytes(data[offset+4:offset+8], order)
+                offset += 8 + ctx_data_len
+                rem = offset % 4
+                if rem:
+                    offset += 4 - rem
+
+            if offset + 8 > len(data):
+                print("  [%s / %s] truncated reply" % (key or b'<empty>', op))
+                continue
+
+            status = int.from_bytes(data[offset+4:offset+8], order)
+            exc_data = data[offset+8:]
+
+            if status == 0:
+                print("  [+] %s / %s -> NO_EXCEPTION, response body %d bytes" % (
+                    key or b'<empty>', op, len(exc_data)))
+                print("      hex: %s" % exc_data[:128].hex())
+                # Try to find printable strings in the response
+                _print_strings(exc_data)
+            else:
+                statuses = {1: 'USER_EXCEPTION', 2: 'SYSTEM_EXCEPTION', 3: 'LOCATION_FORWARD'}
+                print("  [-] %s / %s -> %s" % (
+                    key or b'<empty>', op,
+                    statuses.get(status, 'STATUS_%d' % status)))
+
+        except Exception as e:
+            print("  [!] %s / %s -> error: %s" % (key or b'<empty>', op, e))
+
+
+def _print_strings(data, min_len=5):
+    """Extract and print human-readable ASCII strings from binary data."""
+    current = []
+    found = []
+    for b in data:
+        if 32 <= b <= 126:
+            current.append(chr(b))
+        else:
+            if len(current) >= min_len:
+                found.append(''.join(current))
+            current = []
+    if len(current) >= min_len:
+        found.append(''.join(current))
+    if found:
+        print("      strings: %s" % ' | '.join(found[:20]))
+
+
+# ── main ────────────────────────────────────────────────────────────────────
+
+COMMON_KEYS = [
+    # OmniVista / scheduler
+    "SchedulerInterface",
+    "Scheduler",
+    "NMSScheduler",
+    "OmniVistaScheduler",
+    "SchedulerService",
+    "NmsScheduler",
+    "omni/SchedulerInterface",
+    "8770/SchedulerInterface",
+    # WebSphere standard
+    "NameService",
+    "InterfaceRepository",
+    "RootPOA",
+    "POACurrent",
+    "TransientNameService",
+    "BootstrapServer",
+    # IBM WebSphere admin / JMX
+    "JMXConnector",
+    "AdminService",
+    "ConfigService",
+    # Generic
+    "Scheduler",
+    "Service",
+    "Root",
+    "server",
+    "Server",
+]
+
+if __name__ == '__main__':
+    if len(sys.argv) < 4:
+        print("Usage:")
+        print("  %s <host> <port> locate [key1 key2 ...]" % sys.argv[0])
+        print("  %s <host> <port> naming" % sys.argv[0])
+        sys.exit(1)
+
+    host = sys.argv[1]
+    port = int(sys.argv[2])
+    mode = sys.argv[3]
+
+    if mode == 'locate':
+        keys = sys.argv[4:] if len(sys.argv) > 4 else COMMON_KEYS
+        print("[*] LocateRequest probing %s:%d (%d keys)" % (host, port, len(keys)))
+        for key in keys:
+            status, _ = locate_request(host, port, key)
+            marker = '[+]' if status == 'OBJECT_HERE' else '[-]'
+            print("  %s %-40s %s" % (marker, key, status))
+
+    elif mode == 'naming':
+        print("[*] Naming service bootstrap on %s:%d" % (host, port))
+        try_bootstrap_naming(host, port)
+
+    else:
+        print("Unknown mode: %s" % mode)
+        sys.exit(1)
