@@ -1,0 +1,675 @@
+#!/usr/bin/env python3
+"""
+GIOP enumerator for IBM WebSphere IIOP ports.
+  1. LocateRequest -- probe whether an object key exists (no auth needed)
+  2. Naming service bootstrap -- get NameService IOR from port 2809/9900,
+     then list() the root context to see every registered CORBA object.
+  3. IOR decode -- parse Interoperable Object References
+  4. Invoke -- call an operation on a found object key
+
+Usage:
+  python3 giop_enum.py <host> <port> locate  [key1 key2 ...]
+  python3 giop_enum.py <host> <port> naming
+  python3 giop_enum.py <host> <port> invoke  <key> <operation> [arg_string]
+  python3 giop_enum.py <host> scan   <port1,port2,...>
+  python3 giop_enum.py decode <ior_hex_or_string>
+"""
+
+import socket
+import sys
+import struct
+import binascii
+
+
+# ── low-level helpers ────────────────────────────────────────────────────────
+
+def recv_giop(sock):
+    header = b''
+    while len(header) < 12:
+        chunk = sock.recv(12 - len(header))
+        if not chunk:
+            break
+        header += chunk
+    if len(header) < 12 or header[:4] != b'GIOP':
+        sock.settimeout(1.0)
+        try:
+            while True:
+                chunk = sock.recv(4096)
+                if not chunk:
+                    break
+                header += chunk
+        except Exception:
+            pass
+        finally:
+            sock.settimeout(None)
+        return header
+    big_endian = (header[6] == 0)
+    msg_size = int.from_bytes(header[8:12], 'big' if big_endian else 'little')
+    body = b''
+    while len(body) < msg_size:
+        chunk = sock.recv(msg_size - len(body))
+        if not chunk:
+            break
+        body += chunk
+    return header + body
+
+
+def connect(host, port, timeout=10):
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    s.settimeout(timeout)
+    s.connect((host, port))
+    return s
+
+
+def giop_header(msg_type, body_len):
+    # GIOP 1.0, big-endian, given message type
+    return b'GIOP' + bytes([1, 0, 0, msg_type]) + struct.pack('>I', body_len)
+
+
+def cdr_string(s):
+    """CDR-encode a string: 4-byte length (incl null) + chars + null."""
+    encoded = s.encode('ascii') + b'\x00'
+    return struct.pack('>I', len(encoded)) + encoded
+
+
+def cdr_pad4(data):
+    """Pad data to a 4-byte boundary."""
+    rem = len(data) % 4
+    if rem:
+        data += b'\x00' * (4 - rem)
+    return data
+
+
+def _print_strings(data, min_len=5):
+    """Extract and print human-readable ASCII strings from binary data."""
+    current = []
+    found = []
+    for b in data:
+        if 32 <= b <= 126:
+            current.append(chr(b))
+        else:
+            if len(current) >= min_len:
+                found.append(''.join(current))
+            current = []
+    if len(current) >= min_len:
+        found.append(''.join(current))
+    if found:
+        print("      strings: %s" % ' | '.join(found[:30]))
+
+
+# ── IOR parser ───────────────────────────────────────────────────────────────
+
+def parse_ior(ior_str):
+    """
+    Parse a stringified IOR (IOR:hexhex...) or raw hex bytes.
+    Returns dict with: type_id, profiles [{tag, host, port, object_key}]
+    """
+    if isinstance(ior_str, str) and ior_str.upper().startswith('IOR:'):
+        ior_str = ior_str[4:]
+    if isinstance(ior_str, str):
+        try:
+            data = bytes.fromhex(ior_str)
+        except Exception:
+            return None
+    else:
+        data = ior_str
+
+    if len(data) < 8:
+        return None
+
+    # First byte is byte order flag (big=0, little=1)
+    bo = 'little' if data[0] == 1 else 'big'
+    offset = 4  # skip the encapsulation header (byte_order + 3 pad)
+
+    def rd_u32():
+        nonlocal offset
+        v = int.from_bytes(data[offset:offset+4], bo)
+        offset += 4
+        return v
+
+    def rd_str():
+        nonlocal offset
+        n = rd_u32()
+        s = data[offset:offset+n].rstrip(b'\x00').decode('ascii', errors='replace')
+        offset += n
+        # align to 4
+        rem = offset % 4
+        if rem:
+            offset += 4 - rem
+        return s
+
+    try:
+        type_id = rd_str()
+        profile_count = rd_u32()
+        profiles = []
+        for _ in range(profile_count):
+            tag = rd_u32()
+            profile_len = rd_u32()
+            profile_data = data[offset:offset+profile_len]
+            offset += profile_len
+
+            if tag == 0:  # TAG_INTERNET_IOP
+                pbo = 'little' if profile_data[0] == 1 else 'big'
+                poff = 4
+                # IIOP version (2 bytes)
+                major = profile_data[poff]; minor = profile_data[poff+1]
+                poff += 2
+                # host string
+                hlen = int.from_bytes(profile_data[poff:poff+4], pbo)
+                poff += 4
+                host = profile_data[poff:poff+hlen].rstrip(b'\x00').decode('ascii', errors='replace')
+                poff += hlen
+                rem = poff % 2
+                if rem: poff += 2 - rem
+                port = int.from_bytes(profile_data[poff:poff+2], pbo)
+                poff += 2
+                rem = poff % 4
+                if rem: poff += 4 - rem
+                klen = int.from_bytes(profile_data[poff:poff+4], pbo)
+                poff += 4
+                key = profile_data[poff:poff+klen]
+                profiles.append({
+                    'tag': tag,
+                    'version': '%d.%d' % (major, minor),
+                    'host': host,
+                    'port': port,
+                    'object_key': key,
+                    'object_key_hex': key.hex(),
+                    'object_key_str': key.decode('ascii', errors='replace'),
+                })
+            else:
+                profiles.append({'tag': tag, 'raw': profile_data.hex()})
+
+        return {'type_id': type_id, 'profiles': profiles}
+    except Exception as e:
+        return {'error': str(e), 'raw_hex': data.hex()}
+
+
+def print_ior(ior):
+    if ior is None:
+        print("  (could not parse IOR)")
+        return
+    if 'error' in ior:
+        print("  IOR parse error: %s" % ior['error'])
+        return
+    print("  type_id: %s" % ior['type_id'])
+    for p in ior['profiles']:
+        if p.get('tag') == 0:
+            print("  endpoint: %s:%d  key=%s  (%s)" % (
+                p['host'], p['port'],
+                p['object_key_hex'],
+                p['object_key_str'].strip('\x00')))
+        else:
+            print("  profile tag=%d raw=%s" % (p['tag'], p.get('raw', '')[:32]))
+
+
+# ── scan response for IOR strings ────────────────────────────────────────────
+
+def extract_iors(data):
+    """Find any IOR: strings embedded in a binary response."""
+    s = data.decode('ascii', errors='replace')
+    iors = []
+    idx = 0
+    while True:
+        pos = s.find('IOR:', idx)
+        if pos < 0:
+            break
+        end = pos + 4
+        while end < len(s) and s[end] in '0123456789abcdefABCDEF':
+            end += 1
+        iors.append(s[pos:end])
+        idx = end
+    return iors
+
+
+# ── GIOP LocateRequest (message type 3) ─────────────────────────────────────
+
+LOCATE_STATUS = {0: 'UNKNOWN_OBJECT', 1: 'OBJECT_HERE', 2: 'OBJECT_FORWARD'}
+
+def locate_request(host, port, object_key, req_id=1):
+    """
+    Send a GIOP 1.0 LocateRequest for `object_key` (bytes or str).
+    Returns (status_name, raw_response).
+    """
+    if isinstance(object_key, str):
+        object_key = object_key.encode('ascii')
+
+    key_field = struct.pack('>I', len(object_key)) + object_key
+    key_field = cdr_pad4(key_field)
+
+    body = struct.pack('>I', req_id) + key_field
+    msg  = giop_header(3, len(body)) + body
+
+    s = connect(host, port)
+    s.send(msg)
+    data = recv_giop(s)
+    s.close()
+
+    if len(data) < 16 or data[:4] != b'GIOP' or data[7] != 4:  # type 4 = LocateReply
+        return ('NO_REPLY', data)
+
+    big_endian = (data[6] == 0)
+    order = 'big' if big_endian else 'little'
+    status = int.from_bytes(data[12:16], order)
+
+    result = LOCATE_STATUS.get(status, 'STATUS_%d' % status)
+
+    # If OBJECT_FORWARD, parse the embedded IOR
+    if status == 2 and len(data) > 16:
+        forward_ior_data = data[16:]
+        # Try to find a GIOP-encoded IOR (starts with encapsulation)
+        ior = {'type_id': '(forwarded)', 'profiles': []}
+        # The forward body is a CDR-encoded IOR
+        try:
+            bo = 'little' if forward_ior_data[0] == 1 else 'big'
+            ior = parse_ior(forward_ior_data)
+        except Exception:
+            pass
+        return (result, data, ior)
+
+    return (result, data)
+
+
+# ── GIOP Request builder ─────────────────────────────────────────────────────
+
+def giop_request(object_key, operation, body_bytes=b'', req_id=1):
+    """Build a GIOP 1.0 Request message."""
+    if isinstance(object_key, str):
+        object_key = object_key.encode('ascii')
+    if isinstance(operation, str):
+        operation = operation.encode('ascii')
+
+    hdr = struct.pack('>I', 0)          # service_context_count = 0
+    hdr += struct.pack('>I', req_id)    # request_id
+    hdr += b'\x01'                      # response_expected = true
+    hdr += b'\x00\x00\x00'             # padding
+
+    key_enc = struct.pack('>I', len(object_key)) + object_key
+    key_enc = cdr_pad4(key_enc)
+    hdr += key_enc
+
+    op_str = operation.decode() if isinstance(operation, bytes) else operation
+    op_enc = cdr_string(op_str)
+    hdr += cdr_pad4(op_enc)
+
+    hdr += struct.pack('>I', 0)        # requesting_principal length = 0
+
+    full_body = hdr + body_bytes
+    return giop_header(0, len(full_body)) + full_body
+
+
+# ── invoke mode ──────────────────────────────────────────────────────────────
+
+def invoke_operation(host, port, object_key, operation, arg_string=None):
+    """
+    Send a GIOP Request to call `operation` on `object_key`.
+    Optionally pass a single CDR string argument.
+    """
+    body = b''
+    if arg_string is not None:
+        body = cdr_string(arg_string)
+
+    msg = giop_request(object_key, operation, body)
+    print("  [>] %s::%s(%s)" % (object_key, operation, arg_string or ''))
+    print("      msg hex: %s..." % msg.hex()[:64])
+
+    s = connect(host, port)
+    s.send(msg)
+    data = recv_giop(s)
+    s.close()
+
+    if len(data) < 12 or data[:4] != b'GIOP':
+        print("  [!] non-GIOP response (%d bytes): %s" % (len(data), data[:64].hex()))
+        try:
+            print("      text: %s" % data.decode('utf-16-be', errors='replace')[:200])
+        except Exception:
+            pass
+        return
+
+    big_endian = (data[6] == 0)
+    order = 'big' if big_endian else 'little'
+    minor_v = data[5]
+
+    if minor_v >= 2:
+        status = int.from_bytes(data[16:20], order)
+        exc_data = data[20:]
+    else:
+        offset = 12
+        ctx_count = int.from_bytes(data[offset:offset+4], order)
+        offset += 4
+        for _ in range(ctx_count):
+            if offset + 8 > len(data):
+                break
+            ctx_data_len = int.from_bytes(data[offset+4:offset+8], order)
+            offset += 8 + ctx_data_len
+            rem = offset % 4
+            if rem:
+                offset += 4 - rem
+        if offset + 8 > len(data):
+            print("  [!] truncated reply")
+            return
+        status = int.from_bytes(data[offset+4:offset+8], order)
+        exc_data = data[offset+8:]
+
+    statuses = {0: 'NO_EXCEPTION', 1: 'USER_EXCEPTION', 2: 'SYSTEM_EXCEPTION', 3: 'LOCATION_FORWARD'}
+    s_str = statuses.get(status, 'STATUS_%d' % status)
+
+    if status == 0:
+        print("  [+] %s — body %d bytes" % (s_str, len(exc_data)))
+        print("      hex: %s" % exc_data[:256].hex())
+        _print_strings(exc_data)
+        # Check for embedded IORs
+        iors = extract_iors(exc_data)
+        for ior_str in iors:
+            print("  [IOR found] %s..." % ior_str[:60])
+            print_ior(parse_ior(ior_str))
+    elif status == 3:  # LOCATION_FORWARD
+        print("  [~] LOCATION_FORWARD")
+        if exc_data:
+            fwd = parse_ior(exc_data)
+            print_ior(fwd)
+    else:
+        print("  [-] %s" % s_str)
+        if exc_data:
+            # try CDR string
+            try:
+                slen = int.from_bytes(exc_data[:4], order)
+                if 4 < slen < 512:
+                    msg_str = exc_data[4:4+slen].rstrip(b'\x00').decode('ascii', errors='replace')
+                    print("      %s" % msg_str)
+            except Exception:
+                pass
+            _print_strings(exc_data)
+
+
+# ── CORBA naming service bootstrap ──────────────────────────────────────────
+
+def try_bootstrap_naming(host, port):
+    """
+    Try to get the NameService IOR from the WebSphere bootstrap port.
+    """
+    attempts = [
+        (b'', 'resolve_initial_references', 'NameService'),
+        (b'BootstrapServer', 'getInitialReferences', 'NameService'),
+        (b'NameService', '_is_a', 'IDL:omg.org/CosNaming/NamingContext:1.0'),
+        (b'NameService', 'list', None),
+        (b'TransientNameService', 'list', None),
+        # WebSphere admin bootstrap
+        (b'BootstrapServer', 'getInitialReferences', 'AdminService'),
+        (b'BootstrapServer', 'getInitialReferences', 'InterfaceRepository'),
+        (b'BootstrapServer', 'getInitialReferences', 'RootPOA'),
+    ]
+
+    for (key, op, arg) in attempts:
+        try:
+            body = b''
+            if arg is not None:
+                body = cdr_string(arg)
+
+            msg = giop_request(key, op, body)
+            s = connect(host, port)
+            s.send(msg)
+            data = recv_giop(s)
+            s.close()
+
+            if len(data) < 12 or data[:4] != b'GIOP':
+                print("  [%s / %s] non-GIOP response (%d bytes)" % (
+                    key or b'<empty>', op, len(data)))
+                continue
+
+            big_endian = (data[6] == 0)
+            order = 'big' if big_endian else 'little'
+
+            # parse service contexts
+            offset = 12
+            ctx_count = int.from_bytes(data[offset:offset+4], order)
+            offset += 4
+            for _ in range(ctx_count):
+                if offset + 8 > len(data):
+                    break
+                ctx_data_len = int.from_bytes(data[offset+4:offset+8], order)
+                offset += 8 + ctx_data_len
+                rem = offset % 4
+                if rem:
+                    offset += 4 - rem
+
+            if offset + 8 > len(data):
+                print("  [%s / %s] truncated reply" % (key or b'<empty>', op))
+                continue
+
+            status = int.from_bytes(data[offset+4:offset+8], order)
+            exc_data = data[offset+8:]
+
+            if status == 0:
+                print("  [+] %s / %s -> NO_EXCEPTION, body %d bytes" % (
+                    key or b'<empty>', op, len(exc_data)))
+                print("      hex: %s" % exc_data[:128].hex())
+                _print_strings(exc_data)
+                # Scan for IOR strings
+                iors = extract_iors(exc_data)
+                for ior_str in iors:
+                    print("  [IOR] %s..." % ior_str[:80])
+                    print_ior(parse_ior(ior_str))
+            elif status == 3:
+                print("  [~] %s / %s -> LOCATION_FORWARD" % (key or b'<empty>', op))
+                if exc_data:
+                    fwd = parse_ior(exc_data)
+                    print_ior(fwd)
+            else:
+                statuses = {1: 'USER_EXCEPTION', 2: 'SYSTEM_EXCEPTION'}
+                print("  [-] %s / %s -> %s" % (
+                    key or b'<empty>', op,
+                    statuses.get(status, 'STATUS_%d' % status)))
+                _print_strings(exc_data)
+
+        except Exception as e:
+            print("  [!] %s / %s -> error: %s" % (key or b'<empty>', op, e))
+
+
+# ── CosNaming list ───────────────────────────────────────────────────────────
+
+def cosnaming_list(host, port, object_key, max_list=100):
+    """
+    Call CosNaming::NamingContext::list() on the given object key.
+    Returns a list of names found.
+    """
+    # body: how_many (ULong)
+    body = struct.pack('>I', max_list)
+    msg = giop_request(object_key, 'list', body)
+    s = connect(host, port)
+    s.send(msg)
+    data = recv_giop(s)
+    s.close()
+
+    if len(data) < 12 or data[:4] != b'GIOP':
+        print("  [!] non-GIOP response")
+        return []
+
+    big_endian = (data[6] == 0)
+    order = 'big' if big_endian else 'little'
+    offset = 12
+    ctx_count = int.from_bytes(data[offset:offset+4], order)
+    offset += 4
+    for _ in range(ctx_count):
+        if offset + 8 > len(data): break
+        ctx_data_len = int.from_bytes(data[offset+4:offset+8], order)
+        offset += 8 + ctx_data_len
+        rem = offset % 4
+        if rem: offset += 4 - rem
+
+    if offset + 8 > len(data):
+        return []
+    status = int.from_bytes(data[offset+4:offset+8], order)
+    body_data = data[offset+8:]
+
+    if status != 0:
+        print("  [-] list() returned status %d" % status)
+        _print_strings(body_data)
+        return []
+
+    print("  [+] list() NO_EXCEPTION, body %d bytes" % len(body_data))
+    _print_strings(body_data)
+    print("      hex: %s" % body_data[:256].hex())
+    return body_data
+
+
+# ── main ────────────────────────────────────────────────────────────────────
+
+COMMON_KEYS = [
+    # OmniVista / Alcatel-Lucent 8770 scheduler
+    "SchedulerInterface",
+    "Scheduler",
+    "NMSScheduler",
+    "OmniVistaScheduler",
+    "SchedulerService",
+    "NmsScheduler",
+    "omni/SchedulerInterface",
+    "8770/SchedulerInterface",
+    "AlcatelScheduler",
+    # WebSphere standard bootstrap
+    "NameService",
+    "InterfaceRepository",
+    "RootPOA",
+    "POACurrent",
+    "TransientNameService",
+    "BootstrapServer",
+    # IBM WebSphere admin / JMX
+    "JMXConnector",
+    "AdminService",
+    "ConfigService",
+    "QueryService",
+    "RepositoryService",
+    "DeploymentManager",
+    "NodeAgent",
+    # EJB home common names
+    "ejb/global/scheduler",
+    "ejb/global/SchedulerHome",
+    "ejb/NMS",
+    "corbaname:rloc:///NameService",
+    # IBM WorkManager / AsynchBeans
+    "WorkManager",
+    "DefaultWorkManager",
+    "wm/default",
+    # Generic
+    "Service",
+    "Root",
+    "server",
+    "Server",
+    "NMS",
+    "nms",
+    "scheduler",
+    "Task",
+    "TaskService",
+    "remote",
+    # Short numeric / byte keys IBM uses internally
+    "\x00\x00\x00\x00",
+]
+
+# Operations to try on any OBJECT_HERE key
+PROBE_OPS = [
+    '_is_a',        # standard CORBA, everyone implements this
+    '_non_existent',
+    '_get_interface',
+    'list',         # CosNaming
+    'resolve',      # CosNaming
+    'toString',     # common Java
+    'getVersion',
+    'ping',
+]
+
+
+if __name__ == '__main__':
+    if len(sys.argv) < 3:
+        print(__doc__)
+        sys.exit(1)
+
+    host = sys.argv[1]
+
+    # Special: decode an IOR string directly
+    if host == 'decode':
+        ior_str = sys.argv[2]
+        ior = parse_ior(ior_str)
+        print_ior(ior)
+        sys.exit(0)
+
+    port_str = sys.argv[2]
+    mode = sys.argv[3] if len(sys.argv) > 3 else 'locate'
+
+    if mode == 'scan':
+        # scan multiple ports: giop_enum.py <host> scan <port1,port2,...>
+        ports = [int(p) for p in port_str.split(',')]
+        print("[*] Scanning %d ports on %s" % (len(ports), host))
+        found_anywhere = []
+        for port in ports:
+            print("\n[*] Port %d" % port)
+            for key in COMMON_KEYS:
+                if key.startswith('\x00'):
+                    key_bytes = key.encode('ascii') if not key.startswith('\x00') else b'\x00\x00\x00\x00'
+                else:
+                    key_bytes = key
+                try:
+                    result = locate_request(host, port, key_bytes)
+                    status = result[0]
+                    if status != 'UNKNOWN_OBJECT' and status != 'NO_REPLY':
+                        marker = '[+]' if status == 'OBJECT_HERE' else '[~]'
+                        print("  %s port=%-5d %-40s %s" % (marker, port, key, status))
+                        found_anywhere.append((port, key, status))
+                        if status == 'OBJECT_FORWARD' and len(result) > 2:
+                            print_ior(result[2])
+                except Exception as e:
+                    print("  [!] port=%-5d %-40s error: %s" % (port, key, e))
+        print("\n[*] Summary of found objects:")
+        for (port, key, status) in found_anywhere:
+            print("  port=%-5d %-40s %s" % (port, key, status))
+
+    elif mode == 'locate':
+        port = int(port_str)
+        keys = sys.argv[4:] if len(sys.argv) > 4 else COMMON_KEYS
+        print("[*] LocateRequest probing %s:%d (%d keys)" % (host, port, len(keys)))
+        for key in keys:
+            key_bytes = b'\x00\x00\x00\x00' if key == '\x00\x00\x00\x00' else key.encode('ascii') if isinstance(key, str) else key
+            try:
+                result = locate_request(host, port, key_bytes)
+                status = result[0]
+                marker = '[+]' if status == 'OBJECT_HERE' else ('[ ]' if status == 'UNKNOWN_OBJECT' else '[~]')
+                print("  %s %-40s %s" % (marker, key, status))
+                if status == 'OBJECT_FORWARD' and len(result) > 2:
+                    print_ior(result[2])
+                    # Also probe operations on the forwarded endpoint
+                    fwd = result[2]
+                    if fwd and fwd.get('profiles'):
+                        p = fwd['profiles'][0]
+                        print("  [>] probing forwarded endpoint %s:%d" % (p.get('host'), p.get('port')))
+                elif status == 'OBJECT_HERE':
+                    # Probe operations
+                    print("  [>] probing operations on %s..." % key)
+                    for op in PROBE_OPS[:3]:  # just _is_a, _non_existent, list
+                        invoke_operation(host, port, key_bytes, op,
+                            'IDL:omg.org/CosNaming/NamingContext:1.0' if op == '_is_a' else None)
+            except Exception as e:
+                print("  [!] %-40s error: %s" % (key, e))
+
+    elif mode == 'naming':
+        port = int(port_str)
+        print("[*] Naming service bootstrap on %s:%d" % (host, port))
+        try_bootstrap_naming(host, port)
+
+    elif mode == 'invoke':
+        port = int(port_str)
+        if len(sys.argv) < 5:
+            print("Usage: %s <host> <port> invoke <key> <operation> [arg_string]" % sys.argv[0])
+            sys.exit(1)
+        key = sys.argv[4]
+        op  = sys.argv[5]
+        arg = sys.argv[6] if len(sys.argv) > 6 else None
+        invoke_operation(host, port, key, op, arg)
+
+    elif mode == 'coslist':
+        port = int(port_str)
+        key = sys.argv[4] if len(sys.argv) > 4 else 'NameService'
+        print("[*] CosNaming list() on %s:%d key=%s" % (host, port, key))
+        cosnaming_list(host, port, key.encode('ascii'))
+
+    else:
+        print("Unknown mode: %s" % mode)
+        sys.exit(1)
